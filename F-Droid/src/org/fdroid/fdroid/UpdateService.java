@@ -160,6 +160,18 @@ public class UpdateService extends IntentService implements ProgressListener {
                 .setOngoing(true)
                 .setCategory(NotificationCompat.CATEGORY_SERVICE)
                 .setContentTitle(getString(R.string.update_notification_title));
+
+        // Android docs are a little sketchy, however it seems that Gingerbread is the last
+        // sdk that made a content intent mandatory:
+        //
+        //   http://stackoverflow.com/a/20032920
+        //
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.GINGERBREAD_MR1) {
+            Intent pendingIntent = new Intent(this, FDroid.class);
+            pendingIntent.addFlags (Intent.FLAG_ACTIVITY_NEW_TASK);
+            notificationBuilder.setContentIntent(PendingIntent.getActivity(this, 0, pendingIntent, PendingIntent.FLAG_UPDATE_CURRENT));
+        }
+
         notificationManager.notify(NOTIFY_ID_UPDATING, notificationBuilder.build());
     }
 
