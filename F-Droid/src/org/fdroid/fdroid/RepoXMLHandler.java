@@ -19,6 +19,8 @@
 
 package org.fdroid.fdroid;
 
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 import android.text.TextUtils;
 
 import org.fdroid.fdroid.data.Apk;
@@ -33,51 +35,53 @@ import java.util.List;
 
 /**
  * Parses the index.xml into Java data structures.
+ *
+ * For streaming apks from an index file, it is helpful if the index has the <repo> tag before
+ * any <application> tags. This means that apps and apks can be saved instantly by the RepoUpdater,
+ * without having to buffer them at all, saving memory. The XML spec doesn't mandate order like
+ * this, though it is almost always a fair assumption:
+ *
+ *   http://www.ibm.com/developerworks/library/x-eleord/index.html
+ *
+ * This is doubly so, as repo indices are likely from fdroidserver, which will output everybodys
+ * repo the same way. Having said that, this also should not be _forced_ upon people, but we can
+ * at least consider rejecting malformed indexes.
  */
 public class RepoXMLHandler extends DefaultHandler {
 
     // The repo we're processing.
     private final Repo repo;
 
-    private final List<App> apps = new ArrayList<>();
-    private final List<Apk> apksList = new ArrayList<>();
+    private List<Apk> apksList = new ArrayList<>();
 
     private App curapp = null;
     private Apk curapk = null;
-    private final StringBuilder curchars = new StringBuilder();
+
+    private String currentApkHashType = null;
 
     // After processing the XML, these will be -1 if the index didn't specify
     // them - otherwise it will be the value specified.
-    private int version = -1;
-    private int maxage = -1;
+    private int repoMaxAge = -1;
+    private int repoVersion = 0;
+    private String repoDescription;
+    private String repoName;
 
-    /** the X.509 signing certificate stored in the header of index.xml */
-    private String signingCertFromIndexXml;
+    // the X.509 signing certificate stored in the header of index.xml
+    private String repoSigningCert;
 
-    private String name;
-    private String description;
-    private String hashType;
+    private final StringBuilder curchars = new StringBuilder();
 
-    public RepoXMLHandler(Repo repo) {
-        this.repo = repo;
-        signingCertFromIndexXml = null;
-        name = null;
-        description = null;
+    interface IndexReceiver {
+        void receiveRepo(String name, String description, String signingCert, int maxage, int version);
+        void receiveApp(App app, List<Apk> packages);
     }
 
-    public List<App> getApps() { return apps; }
+    private IndexReceiver receiver;
 
-    public List<Apk> getApks() { return apksList; }
-
-    public int getMaxAge() { return maxage; }
-
-    public int getVersion() { return version; }
-
-    public String getDescription() { return description; }
-
-    public String getName() { return name; }
-
-    public String getSigningCertFromIndexXml() { return signingCertFromIndexXml; }
+    public RepoXMLHandler(Repo repo, @NonNull IndexReceiver receiver) {
+        this.repo = repo;
+        this.receiver = receiver;
+    }
 
     @Override
     public void characters(char[] ch, int start, int length) {
@@ -85,28 +89,19 @@ public class RepoXMLHandler extends DefaultHandler {
     }
 
     @Override
-    public void endElement(String uri, String localName, String qName)
+    public void endElement(String uri, String curel, String qName)
             throws SAXException {
 
-        super.endElement(uri, localName, qName);
-        final String curel = localName;
         final String str = curchars.toString().trim();
         final boolean empty = TextUtils.isEmpty(str);
 
         if (curel.equals("application") && curapp != null) {
-            apps.add(curapp);
-            curapp = null;
-            // If the app id is already present in this apps list, then it
-            // means the same index file has a duplicate app, which should
-            // not be allowed.
-            // However, I'm thinking that it should be unefined behaviour,
-            // because it is probably a bug in the fdroid server that made it
-            // happen, and I don't *think* it will crash the client, because
-            // the first app will insert, the second one will update the newly
-            // inserted one.
+            onApplicationParsed();
         } else if (curel.equals("package") && curapk != null && curapp != null) {
             apksList.add(curapk);
             curapk = null;
+        } else if (curel.equals("repo")) {
+            onRepoParsed();
         } else if (!empty && curapk != null) {
             switch (curel) {
             case "version":
@@ -119,12 +114,12 @@ public class RepoXMLHandler extends DefaultHandler {
                 curapk.size = Utils.parseInt(str, 0);
                 break;
             case "hash":
-                if (hashType == null || hashType.equals("md5")) {
+                if (currentApkHashType == null || currentApkHashType.equals("md5")) {
                     if (curapk.hash == null) {
                         curapk.hash = str;
                         curapk.hashType = "MD5";
                     }
-                } else if (hashType.equals("sha256")) {
+                } else if (currentApkHashType.equals("sha256")) {
                     curapk.hash = str;
                     curapk.hashType = "SHA-256";
                 }
@@ -231,8 +226,26 @@ public class RepoXMLHandler extends DefaultHandler {
                 break;
             }
         } else if (!empty && curel.equals("description")) {
-            description = cleanWhiteSpace(str);
+            repoDescription = cleanWhiteSpace(str);
         }
+    }
+
+    private void onApplicationParsed() {
+        receiver.receiveApp(curapp, apksList);
+        curapp = null;
+        apksList = new ArrayList<>();
+        // If the app id is already present in this apps list, then it
+        // means the same index file has a duplicate app, which should
+        // not be allowed.
+        // However, I'm thinking that it should be undefined behaviour,
+        // because it is probably a bug in the fdroid server that made it
+        // happen, and I don't *think* it will crash the client, because
+        // the first app will insert, the second one will update the newly
+        // inserted one.
+    }
+
+    private void onRepoParsed() {
+        receiver.receiveRepo(repoName, repoDescription, repoSigningCert, repoMaxAge, repoVersion);
     }
 
     @Override
@@ -241,17 +254,11 @@ public class RepoXMLHandler extends DefaultHandler {
         super.startElement(uri, localName, qName, attributes);
 
         if (localName.equals("repo")) {
-            signingCertFromIndexXml = attributes.getValue("", "pubkey");
-            maxage = Utils.parseInt(attributes.getValue("", "maxage"), -1);
-            version = Utils.parseInt(attributes.getValue("", "version"), -1);
-
-            final String nm = attributes.getValue("", "name");
-            if (nm != null)
-                name = cleanWhiteSpace(nm);
-            final String dc = attributes.getValue("", "description");
-            if (dc != null)
-                description = cleanWhiteSpace(dc);
-
+            repoSigningCert = attributes.getValue("", "pubkey");
+            repoMaxAge = Utils.parseInt(attributes.getValue("", "maxage"), -1);
+            repoVersion = Utils.parseInt(attributes.getValue("", "version"), -1);
+            repoName = cleanWhiteSpace(attributes.getValue("", "name"));
+            repoDescription = cleanWhiteSpace(attributes.getValue("", "description"));
         } else if (localName.equals("application") && curapp == null) {
             curapp = new App();
             curapp.id = attributes.getValue("", "id");
@@ -259,15 +266,15 @@ public class RepoXMLHandler extends DefaultHandler {
             curapk = new Apk();
             curapk.id = curapp.id;
             curapk.repo = repo.getId();
-            hashType = null;
+            currentApkHashType = null;
 
         } else if (localName.equals("hash") && curapk != null) {
-            hashType = attributes.getValue("", "type");
+            currentApkHashType = attributes.getValue("", "type");
         }
         curchars.setLength(0);
     }
 
-    private String cleanWhiteSpace(String str) {
-        return str.replaceAll("\n", " ").replaceAll("  ", " ");
+    private String cleanWhiteSpace(@Nullable String str) {
+        return str == null ? null : str.replaceAll("\\s", " ");
     }
 }

@@ -23,19 +23,15 @@ import android.app.IntentService;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
-import android.content.ContentProviderOperation;
-import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.OperationApplicationException;
 import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.net.Uri;
 import android.os.Build;
-import android.os.RemoteException;
 import android.os.SystemClock;
 import android.preference.PreferenceManager;
 import android.support.v4.app.NotificationCompat;
@@ -45,7 +41,6 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.widget.Toast;
 
-import org.fdroid.fdroid.data.Apk;
 import org.fdroid.fdroid.data.ApkProvider;
 import org.fdroid.fdroid.data.App;
 import org.fdroid.fdroid.data.AppProvider;
@@ -54,9 +49,7 @@ import org.fdroid.fdroid.data.RepoProvider;
 import org.fdroid.fdroid.net.Downloader;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 public class UpdateService extends IntentService implements ProgressListener {
 
@@ -88,20 +81,6 @@ public class UpdateService extends IntentService implements ProgressListener {
     public UpdateService() {
         super("UpdateService");
     }
-
-    /**
-     * When an app already exists in the db, and we are updating it on the off chance that some
-     * values changed in the index, some fields should not be updated. Rather, they should be
-     * ignored, because they were explicitly set by the user, and hence can't be automatically
-     * overridden by the index.
-     *
-     * NOTE: In the future, these attributes will be moved to a join table, so that the app table
-     * is essentially completely transient, and can be nuked at any time.
-     */
-    private static final String[] APP_FIELDS_TO_IGNORE = {
-        AppProvider.DataColumns.IGNORE_ALLUPDATES,
-        AppProvider.DataColumns.IGNORE_THISUPDATE
-    };
 
     public static void updateNow(Context context) {
         updateRepoNow(null, context);
@@ -327,6 +306,7 @@ public class UpdateService extends IntentService implements ProgressListener {
     @Override
     protected void onHandleIntent(Intent intent) {
 
+        long startTime = System.currentTimeMillis();
         String address = intent.getStringExtra(EXTRA_ADDRESS);
         boolean manualUpdate = intent.getBooleanExtra(EXTRA_MANUAL_UPDATE, false);
 
@@ -344,16 +324,12 @@ public class UpdateService extends IntentService implements ProgressListener {
             // database while we do all the downloading, etc...
             List<Repo> repos = RepoProvider.Helper.all(this);
 
-            // Process each repo...
-            Map<String, App> appsToUpdate = new HashMap<>();
-            List<Apk> apksToUpdate = new ArrayList<>();
             //List<Repo> swapRepos = new ArrayList<>();
             List<Repo> unchangedRepos = new ArrayList<>();
             List<Repo> updatedRepos = new ArrayList<>();
             List<Repo> disabledRepos = new ArrayList<>();
             List<CharSequence> errorRepos = new ArrayList<>();
             ArrayList<CharSequence> repoErrors = new ArrayList<>();
-            List<RepoUpdater.RepoUpdateRememberer> repoUpdateRememberers = new ArrayList<>();
             boolean changes = false;
             boolean singleRepoUpdate = !TextUtils.isEmpty(address);
             for (final Repo repo : repos) {
@@ -375,13 +351,8 @@ public class UpdateService extends IntentService implements ProgressListener {
                 try {
                     updater.update();
                     if (updater.hasChanged()) {
-                        for (final App app : updater.getApps()) {
-                            appsToUpdate.put(app.id, app);
-                        }
-                        apksToUpdate.addAll(updater.getApks());
                         updatedRepos.add(repo);
                         changes = true;
-                        repoUpdateRememberers.add(updater.getRememberer());
                     } else {
                         unchangedRepos.add(repo);
                     }
@@ -397,19 +368,6 @@ public class UpdateService extends IntentService implements ProgressListener {
             } else {
                 sendStatus(STATUS_INFO, getString(R.string.status_checking_compatibility));
 
-                List<App> listOfAppsToUpdate = new ArrayList<>();
-                listOfAppsToUpdate.addAll(appsToUpdate.values());
-
-                calcApkCompatibilityFlags(this, apksToUpdate);
-
-                // Need to do this BEFORE updating the apks, otherwise when it continually
-                // calls "get existing apks for repo X" then it will be getting the newly
-                // created apks, rather than those from the fresh, juicy index we just processed.
-                removeApksNoLongerInRepo(apksToUpdate, updatedRepos);
-
-                int totalInsertsUpdates = listOfAppsToUpdate.size() + apksToUpdate.size();
-                updateOrInsertApps(listOfAppsToUpdate, totalInsertsUpdates, 0);
-                updateOrInsertApks(apksToUpdate, totalInsertsUpdates, listOfAppsToUpdate.size());
                 removeApksFromRepos(disabledRepos);
                 removeAppsWithoutApks();
 
@@ -420,11 +378,6 @@ public class UpdateService extends IntentService implements ProgressListener {
                 AppProvider.Helper.calcDetailsFromIndex(this);
 
                 notifyContentProviders();
-
-                //we only remember the update if everything has gone well
-                for (RepoUpdater.RepoUpdateRememberer rememberer : repoUpdateRememberers) {
-                    rememberer.rememberUpdate();
-                }
 
                 if (prefs.getBoolean(Preferences.PREF_UPD_NOTIFY, true)) {
                     performUpdateNotification();
@@ -452,31 +405,14 @@ public class UpdateService extends IntentService implements ProgressListener {
             Log.e(TAG, "Exception during update processing", e);
             sendStatus(STATUS_ERROR_GLOBAL, e.getMessage());
         }
+
+        long time = System.currentTimeMillis() - startTime;
+        Log.i(TAG, "Updating repo(s) complete, took " + time / 1000 + " seconds to complete.");
     }
 
     private void notifyContentProviders() {
         getContentResolver().notifyChange(AppProvider.getContentUri(), null);
         getContentResolver().notifyChange(ApkProvider.getContentUri(), null);
-    }
-
-    /**
-     * This cannot be offloaded to the database (as we did with the query which
-     * updates apps, depending on whether their apks are compatible or not).
-     * The reason is that we need to interact with the CompatibilityChecker
-     * in order to see if, and why an apk is not compatible.
-     */
-    private static void calcApkCompatibilityFlags(Context context, List<Apk> apks) {
-        final CompatibilityChecker checker = new CompatibilityChecker(context);
-        for (final Apk apk : apks) {
-            final List<String> reasons = checker.getIncompatibleReasons(apk);
-            if (reasons.size() > 0) {
-                apk.compatible = false;
-                apk.incompatible_reasons = Utils.CommaSeparatedList.make(reasons);
-            } else {
-                apk.compatible = true;
-                apk.incompatible_reasons = null;
-            }
-        }
     }
 
     private void performUpdateNotification() {
@@ -544,201 +480,6 @@ public class UpdateService extends IntentService implements ProgressListener {
                         .setStyle(createNotificationBigStyle(hasUpdates));
 
         notificationManager.notify(NOTIFY_ID_UPDATES_AVAILABLE, builder.build());
-    }
-
-    private List<String> getKnownAppIds(List<App> apps) {
-        List<String> knownAppIds = new ArrayList<>();
-        if (apps.size() == 0) {
-            return knownAppIds;
-        }
-        if (apps.size() > AppProvider.MAX_APPS_TO_QUERY) {
-            int middle = apps.size() / 2;
-            List<App> apps1 = apps.subList(0, middle);
-            List<App> apps2 = apps.subList(middle, apps.size());
-            knownAppIds.addAll(getKnownAppIds(apps1));
-            knownAppIds.addAll(getKnownAppIds(apps2));
-        } else {
-            knownAppIds.addAll(getKnownAppIdsFromProvider(apps));
-        }
-        return knownAppIds;
-    }
-
-    /**
-     * Looks in the database to see which apps we already know about. Only
-     * returns ids of apps that are in the database if they are in the "apps"
-     * array.
-     */
-    private List<String> getKnownAppIdsFromProvider(List<App> apps) {
-
-        final Uri uri = AppProvider.getContentUri(apps);
-        final String[] fields = { AppProvider.DataColumns.APP_ID };
-        Cursor cursor = getContentResolver().query(uri, fields, null, null, null);
-
-        int knownIdCount = cursor != null ? cursor.getCount() : 0;
-        List<String> knownIds = new ArrayList<>(knownIdCount);
-        if (cursor != null) {
-            if (knownIdCount > 0) {
-                cursor.moveToFirst();
-                while (!cursor.isAfterLast()) {
-                    knownIds.add(cursor.getString(0));
-                    cursor.moveToNext();
-                }
-            }
-            cursor.close();
-        }
-
-        return knownIds;
-    }
-
-    private void updateOrInsertApps(List<App> appsToUpdate, int totalUpdateCount, int currentCount) {
-
-        List<ContentProviderOperation> operations = new ArrayList<>();
-        List<String> knownAppIds = getKnownAppIds(appsToUpdate);
-        for (final App app : appsToUpdate) {
-            if (knownAppIds.contains(app.id)) {
-                operations.add(updateExistingApp(app));
-            } else {
-                operations.add(insertNewApp(app));
-            }
-        }
-
-        Utils.DebugLog(TAG, "Updating/inserting " + operations.size() + " apps.");
-        try {
-            executeBatchWithStatus(AppProvider.getAuthority(), operations, currentCount, totalUpdateCount);
-        } catch (RemoteException | OperationApplicationException e) {
-            Log.e(TAG, "Could not update or insert apps", e);
-        }
-    }
-
-    private void executeBatchWithStatus(String providerAuthority,
-                                        List<ContentProviderOperation> operations,
-                                        int currentCount,
-                                        int totalUpdateCount)
-            throws RemoteException, OperationApplicationException {
-        int i = 0;
-        while (i < operations.size()) {
-            int count = Math.min(operations.size() - i, 100);
-            ArrayList<ContentProviderOperation> o = new ArrayList<>(operations.subList(i, i + count));
-            sendStatus(STATUS_INFO, getString(
-                R.string.status_inserting,
-                (int)((double)(currentCount + i) / totalUpdateCount * 100)));
-            getContentResolver().applyBatch(providerAuthority, o);
-            i += 100;
-        }
-    }
-
-    /**
-     * Return list of apps from the "apks" argument which are already in the database.
-     */
-    private List<Apk> getKnownApks(List<Apk> apks) {
-        final String[] fields = {
-                ApkProvider.DataColumns.APK_ID,
-                ApkProvider.DataColumns.VERSION,
-                ApkProvider.DataColumns.VERSION_CODE
-        };
-        return ApkProvider.Helper.knownApks(this, apks, fields);
-    }
-
-    private void updateOrInsertApks(List<Apk> apksToUpdate, int totalApksAppsCount, int currentCount) {
-
-        List<ContentProviderOperation> operations = new ArrayList<>();
-
-        List<Apk> knownApks = getKnownApks(apksToUpdate);
-        for (final Apk apk : apksToUpdate) {
-            boolean known = false;
-            for (final Apk knownApk : knownApks) {
-                if (knownApk.id.equals(apk.id) && knownApk.vercode == apk.vercode) {
-                    known = true;
-                    break;
-                }
-            }
-
-            if (known) {
-                operations.add(updateExistingApk(apk));
-            } else {
-                operations.add(insertNewApk(apk));
-                knownApks.add(apk); // In case another repo has the same version/id combo for this apk.
-            }
-        }
-
-        Utils.DebugLog(TAG, "Updating/inserting " + operations.size() + " apks.");
-        try {
-            executeBatchWithStatus(ApkProvider.getAuthority(), operations, currentCount, totalApksAppsCount);
-        } catch (RemoteException | OperationApplicationException e) {
-            Log.e(TAG, "Could not update/insert apps", e);
-        }
-    }
-
-    private ContentProviderOperation updateExistingApk(final Apk apk) {
-        Uri uri = ApkProvider.getContentUri(apk);
-        ContentValues values = apk.toContentValues();
-        return ContentProviderOperation.newUpdate(uri).withValues(values).build();
-    }
-
-    private ContentProviderOperation insertNewApk(final Apk apk) {
-        ContentValues values = apk.toContentValues();
-        Uri uri = ApkProvider.getContentUri();
-        return ContentProviderOperation.newInsert(uri).withValues(values).build();
-    }
-
-    private ContentProviderOperation updateExistingApp(App app) {
-        Uri uri = AppProvider.getContentUri(app);
-        ContentValues values = app.toContentValues();
-        for (final String toIgnore : APP_FIELDS_TO_IGNORE) {
-            if (values.containsKey(toIgnore)) {
-                values.remove(toIgnore);
-            }
-        }
-        return ContentProviderOperation.newUpdate(uri).withValues(values).build();
-    }
-
-    private ContentProviderOperation insertNewApp(App app) {
-        ContentValues values = app.toContentValues();
-        Uri uri = AppProvider.getContentUri();
-        return ContentProviderOperation.newInsert(uri).withValues(values).build();
-    }
-
-    /**
-     * If a repo was updated (i.e. it is in use, and the index has changed
-     * since last time we did an update), then we want to remove any apks that
-     * belong to the repo which are not in the current list of apks that were
-     * retrieved.
-     */
-    private void removeApksNoLongerInRepo(List<Apk> apksToUpdate, List<Repo> updatedRepos) {
-
-        long startTime = System.currentTimeMillis();
-        List<Apk> toRemove = new ArrayList<>();
-
-        final String[] fields = {
-            ApkProvider.DataColumns.APK_ID,
-            ApkProvider.DataColumns.VERSION_CODE,
-            ApkProvider.DataColumns.VERSION,
-        };
-
-        for (final Repo repo : updatedRepos) {
-            final List<Apk> existingApks = ApkProvider.Helper.findByRepo(this, repo, fields);
-            for (final Apk existingApk : existingApks) {
-                if (!isApkToBeUpdated(existingApk, apksToUpdate)) {
-                    toRemove.add(existingApk);
-                }
-            }
-        }
-
-        long duration = System.currentTimeMillis() - startTime;
-        Utils.DebugLog(TAG, "Found " + toRemove.size() + " apks no longer in the updated repos (took " + duration + "ms)");
-
-        if (toRemove.size() > 0) {
-            ApkProvider.Helper.deleteApks(this, toRemove);
-        }
-    }
-
-    private static boolean isApkToBeUpdated(Apk existingApk, List<Apk> apksToUpdate) {
-        for (final Apk apkToUpdate : apksToUpdate) {
-            if (apkToUpdate.vercode == existingApk.vercode && apkToUpdate.id.equals(existingApk.id)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private void removeApksFromRepos(List<Repo> repos) {

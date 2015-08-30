@@ -101,7 +101,7 @@ public abstract class FDroidProvider extends ContentProvider {
 
     abstract protected UriMatcher getMatcher();
 
-    protected String generateQuestionMarksForInClause(int num) {
+    protected static String generateQuestionMarksForInClause(int num) {
         StringBuilder sb = new StringBuilder(num * 2);
         for (int i = 0; i < num; i++) {
             if (i != 0) {
