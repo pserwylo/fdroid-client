@@ -18,6 +18,7 @@ import org.fdroid.fdroid.data.App;
 import org.fdroid.fdroid.data.AppProvider;
 import org.fdroid.fdroid.data.Repo;
 import org.fdroid.fdroid.data.RepoProvider;
+import org.fdroid.fdroid.data.TempApkProvider;
 import org.fdroid.fdroid.net.Downloader;
 import org.fdroid.fdroid.net.DownloaderFactory;
 import org.xml.sax.InputSource;
@@ -213,7 +214,7 @@ public class RepoUpdater {
         apkOperations.addAll(insertOrUpdateApks(apksToSaveList));
 
         try {
-            context.getContentResolver().applyBatch(ApkProvider.getAuthority(), apkOperations);
+            context.getContentResolver().applyBatch(TempApkProvider.getAuthority(), apkOperations);
         } catch (RemoteException | OperationApplicationException e) {
             throw new UpdateException(repo, "An internal error occured while updating the database", e);
         }
@@ -313,7 +314,7 @@ public class RepoUpdater {
      * <strong>Does not do any checks to see if the apk already exists or not.</strong>
      */
     private ContentProviderOperation updateExistingApk(final Apk apk) {
-        Uri uri = ApkProvider.getContentUri(apk);
+        Uri uri = TempApkProvider.getApkUri(apk);
         ContentValues values = apk.toContentValues();
         return ContentProviderOperation.newUpdate(uri).withValues(values).build();
     }
@@ -324,7 +325,7 @@ public class RepoUpdater {
      */
     private ContentProviderOperation insertNewApk(final Apk apk) {
         ContentValues values = apk.toContentValues();
-        Uri uri = ApkProvider.getContentUri();
+        Uri uri = TempApkProvider.getContentUri();
         return ContentProviderOperation.newInsert(uri).withValues(values).build();
     }
 
@@ -364,7 +365,7 @@ public class RepoUpdater {
 
         // TODO: Deal with more than MAX_QUERY_PARAMS...
         if (toDelete.size() > 0) {
-            Uri uri = ApkProvider.getContentUriForApks(repo, toDelete);
+            Uri uri = TempApkProvider.getApksUri(repo, toDelete);
             return ContentProviderOperation.newDelete(uri).build();
         } else {
             return null;
@@ -397,6 +398,13 @@ public class RepoUpdater {
             if (downloadedFile == null || !downloadedFile.exists())
                 throw new UpdateException(repo, downloadedFile + " does not exist!");
 
+            // This is where we will store all of the metadata before commiting at the
+            // end of the process. This is due to the fact that we can't verify the cert
+            // the index was signed with until we've finished reading it - and we don't
+            // want to put stuff in the real database until we are sure it is from a
+            // trusted source.
+            TempApkProvider.Helper.init(context);
+
             // Due to a bug in Android 5.0 Lollipop, the inclusion of spongycastle causes
             // breakage when verifying the signature of the downloaded .jar. For more
             // details, check out https://gitlab.com/fdroid/fdroidclient/issues/111.
@@ -407,9 +415,6 @@ public class RepoUpdater {
             indexInputStream = new ProgressBufferedInputStream(jarFile.getInputStream(indexEntry),
                     progressListener, repo, (int)indexEntry.getSize());
 
-            /* JarEntry can only read certificates after the file represented by that JarEntry
-             * has been read completely, so verification cannot run until now... */
-
             // Process the index...
             final SAXParser parser = SAXParserFactory.newInstance().newSAXParser();
             final XMLReader reader = parser.getXMLReader();
@@ -418,7 +423,11 @@ public class RepoUpdater {
             reader.parse(new InputSource(indexInputStream));
             signingCertFromJar = getSigningCertFromJar(indexEntry);
 
+            // JarEntry can only read certificates after the file represented by that JarEntry
+            // has been read completely, so verification cannot run until now...
             assertSigningCertFromXmlCorrect();
+
+            TempApkProvider.Helper.commit(context);
             RepoProvider.Helper.update(context, repo, repoDetailsToSave);
 
         } catch (SAXException | ParserConfigurationException | IOException e) {
